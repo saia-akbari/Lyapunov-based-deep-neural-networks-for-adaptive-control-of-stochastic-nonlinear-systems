@@ -1,0 +1,35 @@
+{
+    "final_time": 60,
+    "time_step_delta": 0.005,
+    "num_states": 5,
+
+    "ke": 500, 
+    "mean": 0,
+    "covariance": 1,
+    
+    "forgetting_factor1": 0.01,   
+    "forgetting_factor2": 0.001,
+    "forgetting_factor3": 0.005,
+    
+    "num_inputs1": 5,
+    "num_inputs2": 10,
+    "num_inputs3": 10,
+
+    "num_outputs1": 5,
+    "num_outputs2": 1,     
+    "num_outputs3": 5,    
+
+    "num_layers1": 8,
+    "num_layers2": 4,
+    "num_layers3": 9,
+
+
+    "num_neurons1": 8,
+    "num_neurons2": 12,
+    "num_neurons3": 8,
+
+    "learning_rate1": 25,
+    "learning_rate2": 5,
+    "learning_rate3": 25
+
+}
