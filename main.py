@@ -1,9 +1,14 @@
 import numpy as np
+import pandas as pd
+import json
+import os
 from dynamics import State_dynamics, target_dynamics, integrate
 from neural_network import NeuralNetwork
-from data_manager import save_state_data, save_nn_data, generate_comparison_plot
-import json
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
+# --- Classes (State, DesiredTrajectory, Controller, Simulation) remain the same ---
+# (Content omitted for brevity, no changes are needed in these classes)
 class State:
     def __init__(self, num_states, time_steps):
         self.positions = np.zeros((num_states, time_steps))
@@ -28,7 +33,6 @@ class Controller:
         self.ke = config['ke']
 
         # Define inputs for all potential NNs
-        deep_non_mod_input = lambda step, state, trajectory: np.concatenate([state.positions[:, step - 1], trajectory.positions[:, step - 1]]).reshape(-1, 1)
         deep_mod1_input = lambda step, state, trajectory: np.concatenate([state.positions[:, step - 1]]).reshape(-1, 1)
         deep_mod2_input = lambda step, state, trajectory: np.concatenate([state.positions[:, step - 1], trajectory.positions[:, step - 1]]).reshape(-1, 1)
         deep_mod3_input = lambda step, state, trajectory: np.concatenate([state.positions[:, step - 1], trajectory.positions[:, step - 1]]).reshape(-1, 1)
@@ -37,7 +41,6 @@ class Controller:
         self.deep_mod1 = NeuralNetwork(deep_mod1_input, config, "DNN1", config['num_inputs1'], config['num_outputs1'], config['num_layers1'], config['num_neurons1'], config['learning_rate1'], config['forgetting_factor1'])
         self.deep_mod2 = NeuralNetwork(deep_mod2_input, config, "DNN2", config['num_inputs2'], config['num_outputs2'], config['num_layers2'], config['num_neurons2'], config['learning_rate2'], config['forgetting_factor2'])
         self.deep_mod3 = NeuralNetwork(deep_mod3_input, config, "DNN3", config['num_inputs3'], config['num_outputs3'], config['num_layers3'], config['num_neurons3'], config['learning_rate3'], config['forgetting_factor3'])
-        self.deep_drift = NeuralNetwork(deep_mod1_input, config, "DNN1", config['num_inputs1'], config['num_outputs1'], config['num_layers1'], config['num_neurons1'], config['learning_rate1'], config['forgetting_factor1'])
 
     def get_nn_input(self, step, state, trajectory, nn):
         return nn.input_func(step, state, trajectory)
@@ -47,15 +50,6 @@ class Controller:
         deep_mod2_output = self.deep_mod2.compute_neural_network_output(step, tracking_error, self.get_nn_input(step, state, trajectory, self.deep_mod2))
         deep_mod3_output = self.deep_mod3.compute_neural_network_output(step, tracking_error, self.get_nn_input(step, state, trajectory, self.deep_mod3))
         control_input = desired_velocity - self.ke * tracking_error - deep_mod1_output.reshape(-1) - 0.5 * tracking_error * deep_mod2_output.reshape(-1) - deep_mod3_output.reshape(-1)
-        return control_input
-
-    def compute_deep_drift(self, step, tracking_error, desired_velocity, state, trajectory):
-        deep_drift_output = self.deep_drift.compute_neural_network_output(step, tracking_error, self.get_nn_input(step, state, trajectory, self.deep_drift))
-        control_input = desired_velocity - self.ke * tracking_error - deep_drift_output.reshape(-1)
-        return control_input
-    
-    def compute_no_DNN(self, step, tracking_error, desired_velocity, state, trajectory):
-        control_input = desired_velocity - self.ke * tracking_error #- deep_drift_output.reshape(-1)
         return control_input
 
 class Simulation:
@@ -71,57 +65,115 @@ class Simulation:
         self.DesiredTrajectory = DesiredTrajectory(self.num_states, self.time_steps)
         self.controller = Controller(config)
 
-    def run(self, model_type):
+    def run(self):
+        tracking_error_norms = []
         for step in range(1, self.time_steps):
             current_time = step * self.time_step_delta
             tracking_error = self.State.positions[:, step - 1] - self.DesiredTrajectory.positions[:, step - 1]
+            tracking_error_norms.append(np.linalg.norm(tracking_error))
 
-            # --- Select and compute control input based on model_type ---
-            if model_type == 'deep_modular':
-                control_input = self.controller.compute_deep_modular(step, tracking_error, self.DesiredTrajectory.velocities[:, step - 1], self.State, self.DesiredTrajectory)
-            elif model_type == 'deep_drift':
-                control_input = self.controller.compute_deep_drift(step, tracking_error, self.DesiredTrajectory.velocities[:, step - 1], self.State, self.DesiredTrajectory)
-            else:
-                control_input = self.controller.compute_no_DNN(step, tracking_error, self.DesiredTrajectory.velocities[:, step - 1], self.State, self.DesiredTrajectory)
+            control_input = self.controller.compute_deep_modular(step, tracking_error, self.DesiredTrajectory.velocities[:, step - 1], self.State, self.DesiredTrajectory)
 
-            # Update dynamics
             self.State.update_dynamics(step, control_input, self.time_step_delta, self.final_time, self.mean, self.covariance, current_time)
             self.DesiredTrajectory.update_dynamics(step, self.time_step_delta, current_time)
+            
+        rms_error = np.sqrt(np.mean(np.square(tracking_error_norms)))
+        return rms_error
 
-            # --- Save data with a model-specific identifier ---
-            save_state_data(step, current_time, tracking_error, self.num_states, model_type)
-            
-            if model_type == 'deep_modular':
-                save_nn_data(step, current_time, self.controller.deep_mod1, model_type)
-                save_nn_data(step, current_time, self.controller.deep_mod2, model_type)
-                save_nn_data(step, current_time, self.controller.deep_mod3, model_type)
-            elif model_type == 'deep_drift':
-                save_nn_data(step, current_time, self.controller.deep_drift, model_type)
-            
-            print(f"\rProgress ({model_type}): {step/self.time_steps*100:.2f}%", end='', flush=True)
+
+def create_3d_surface_plot(excel_path):
+    """
+    Reads the simulation results from an Excel file and creates a 3D surface plot.
+    """
+    print(f"\nGenerating 3D surface plot from '{excel_path}'...")
+    try:
+        # Read the data from the excel file, setting the first column as the index
+        df = pd.read_excel(excel_path, index_col=0)
+
+        # Create the meshgrid for the plot
+        # X values are the means (columns)
+        # Y values are the covariances (index)
+        X_vals = df.columns.astype(float).values
+        Y_vals = df.index.astype(float).values
+        X, Y = np.meshgrid(X_vals, Y_vals)
+        
+        # Z values are the RMS errors from the DataFrame
+        Z = df.values
+
+        # Create the plot
+        fig = plt.figure(figsize=(12, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Plot the surface with a colormap and edges to mimic the example image
+        # The 'terrain' colormap is similar to the one in the example
+        surf = ax.plot_surface(X, Y, Z, cmap='terrain', rstride=1, cstride=1, alpha=0.9, linewidth=0.3, edgecolor='k')
+
+        # Set labels and title
+        ax.set_xlabel('MEAN', fontweight='bold')
+        ax.set_ylabel('COVARIANCE', fontweight='bold')
+        ax.set_zlabel('RMS OF ||e||', fontweight='bold')
+        ax.set_title('RMS Tracking Error vs. Mean and Covariance', fontsize=16)
+
+        # Set the viewing angle (elevation and azimuth)
+        ax.view_init(elev=30, azim=-120)
+
+        # Add a color bar which maps values to colors.
+        fig.colorbar(surf, shrink=0.5, aspect=10, label='RMS Error Value')
+        
+        # --- MODIFIED LINES ---
+        # 1. Change the filename to end with .svg
+        plot_path = os.path.join(os.path.dirname(excel_path), '3d_surface_plot.svg')
+        
+        # 2. Save the figure in SVG format. The dpi argument is not needed for SVG.
+        plt.savefig(plot_path, format='svg') 
+        
+        print(f"3D plot saved to '{plot_path}'")
+        plt.show()
+
+    except FileNotFoundError:
+        print(f"Error: Could not find the data file at {excel_path}. Cannot generate plot.")
+    except Exception as e:
+        print(f"An error occurred during plotting: {e}")
+
 
 if __name__ == "__main__":
     with open('config.json', 'r') as config_file:
         config = json.load(config_file)
 
-    # --- Run Deep Modular Simulation ---
-    print("Running Deep Modular simulation...")
-    sim_modular = Simulation(config)
-    sim_modular.run(model_type='deep_modular')
-    print("\nDeep Modular simulation completed.")
+    means = np.round(np.arange(-0.1, 0.11, 0.02), 2)
+    covariances = np.arange(1, 11)
 
-    # --- Run Deep Drift Simulation ---
-    print("\nRunning Deep Drift simulation...")
-    sim_drift = Simulation(config)
-    sim_drift.run(model_type='deep_drift')
-    print("\nDeep Drift simulation completed.")
-    
-    # --- Run No DNN Simulation ---
-    print("\nRunning No DNN simulation...")
-    sim_drift = Simulation(config)
-    sim_drift.run(model_type='no_DNN')
-    print("\nNo DNN simulation completed.")
+    results_df = pd.DataFrame(index=covariances, columns=means)
+    results_df.index.name = 'Covariance'
+    results_df.columns.name = 'Mean'
 
-    # --- Generate Comparison Plot ---
-    print("\nGenerating comparison plot...")
-    generate_comparison_plot()
+    output_dir = 'simulation_results'
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'tracking_error_results.xlsx')
+
+    # --- Run Simulations ---
+    # (This entire block is unchanged)
+    total_simulations = len(means) * len(covariances)
+    current_simulation = 0
+    print("Starting simulation runs for a range of means and covariances...")
+    for cov in covariances:
+        for mean in means:
+            current_simulation += 1
+            print(f"\nRunning simulation {current_simulation}/{total_simulations}: Mean = {mean}, Covariance = {cov}")
+            
+            current_config = config.copy()
+            current_config['mean'] = mean
+            current_config['covariance'] = cov
+            
+            sim = Simulation(current_config)
+            rms_error = sim.run()
+            
+            results_df.loc[cov, mean] = rms_error
+            print(f"--> Completed. RMS Tracking Error: {rms_error:.4f}")
+
+    # --- Save Results and Generate Plot ---
+    results_df.to_excel(output_path)
+    print(f"\nAll simulations completed. Results saved to '{output_path}'")
+
+    # Call the new function to create the plot from the saved results
+    create_3d_surface_plot(output_path)
